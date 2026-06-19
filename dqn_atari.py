@@ -91,6 +91,8 @@ def parse_args():
         help="the number of gradient updates after each training trigger")
     parser.add_argument("--torch-threads", type=int, default=1,
         help="the number of CPU threads used by PyTorch in the learner process")
+    parser.add_argument("--allow-tf32", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
+        help="allow TF32 matmul/cuDNN kernels on NVIDIA Ampere+ GPUs")
     parser.add_argument("--checkpoint-frequency", type=int, default=0,
         help="save a checkpoint every N environment steps; 0 disables checkpoints")
     parser.add_argument("--eval-episodes", type=int, default=10,
@@ -254,6 +256,9 @@ if __name__ == "__main__":
         torch.backends.cudnn.benchmark = True
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+    if device.type == "cuda" and args.allow_tf32:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
     print(f"run_name={run_name}")
     print(f"device={device}, num_envs={args.num_envs}, async_vector_env={args.async_vector_env}")
 
