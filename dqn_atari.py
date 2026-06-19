@@ -1,8 +1,12 @@
 import argparse
+import json
 import os
 import random
 import time
+from collections import deque
 from distutils.util import strtobool
+
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
 import gymnasium as gym
 import numpy as np
@@ -18,7 +22,20 @@ from stable_baselines3.common.atari_wrappers import (
     NoopResetEnv
 )
 from stable_baselines3.common.buffers import ReplayBuffer
-from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
+
+try:
+    import ale_py
+
+    if hasattr(gym, "register_envs"):
+        gym.register_envs(ale_py)
+
+    if "ALE/MsPacman-v5" not in gym.envs.registry:
+        from ale_py.registration import register_v5_envs
+
+        register_v5_envs()
+except ImportError:
+    pass
 
 
 def parse_args():
@@ -48,6 +65,8 @@ def parse_args():
         help="the learning rate of the optimizer")
     parser.add_argument("--num-envs", type=int, default=1,
         help="the number of parallel game environments")
+    parser.add_argument("--async-vector-env", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
+        help="use AsyncVectorEnv to run Atari workers in separate processes")
     parser.add_argument("--buffer-size", type=int, default=1000000,
         help="the replay memory buffer size")
     parser.add_argument("--gamma", type=float, default=0.99,
@@ -68,18 +87,30 @@ def parse_args():
         help="timestep to start learning")
     parser.add_argument("--train-frequency", type=int, default=4,
         help="the frequency of training")
+    parser.add_argument("--gradient-steps", type=int, default=1,
+        help="the number of gradient updates after each training trigger")
+    parser.add_argument("--torch-threads", type=int, default=1,
+        help="the number of CPU threads used by PyTorch in the learner process")
+    parser.add_argument("--checkpoint-frequency", type=int, default=0,
+        help="save a checkpoint every N environment steps; 0 disables checkpoints")
+    parser.add_argument("--eval-episodes", type=int, default=10,
+        help="the number of evaluation episodes after training")
+    parser.add_argument("--progress-interval", type=int, default=5000,
+        help="refresh tqdm postfix every N environment steps")
     args = parser.parse_args()
     # fmt: on
-    assert args.num_envs == 1, "vectorized envs are not supported at the moment"
 
     return args
 
 
-def make_env(env_id, seed, idx, capture_video, run_name):
+def make_env(env_id, seed, idx, capture_video, run_name, record_every_episode=False):
     def thunk():
         if capture_video and idx == 0:
             env = gym.make(env_id, render_mode="rgb_array")
-            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
+            video_kwargs = {}
+            if record_every_episode:
+                video_kwargs["episode_trigger"] = lambda episode_id: True
+            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}", **video_kwargs)
         else:
             env = gym.make(env_id)
 
@@ -93,8 +124,15 @@ def make_env(env_id, seed, idx, capture_video, run_name):
         
         env = ClipRewardEnv(env)
         env = gym.wrappers.ResizeObservation(env, (84, 84))
-        env = gym.wrappers.GrayScaleObservation(env)
-        env = gym.wrappers.FrameStack(env, 4)
+        grayscale_wrapper = getattr(gym.wrappers, "GrayScaleObservation", None)
+        if grayscale_wrapper is None:
+            grayscale_wrapper = gym.wrappers.GrayscaleObservation
+        env = grayscale_wrapper(env)
+        frame_stack_wrapper = getattr(gym.wrappers, "FrameStack", None)
+        if frame_stack_wrapper is None:
+            env = gym.wrappers.FrameStackObservation(env, stack_size=4)
+        else:
+            env = frame_stack_wrapper(env, 4)
         env.action_space.seed(seed)
 
         return env
@@ -106,10 +144,16 @@ class QNetwork(nn.Module):
     def __init__(self, env):
         super().__init__()
 
-        # TODO: YOUR CODE HERE
         self.network = nn.Sequential(
-            #nn.Conv2d(4, 32, 8, stride=4),
-
+            nn.Conv2d(4, 32, kernel_size=8, stride=4),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(64 * 7 * 7, 512),
+            nn.ReLU(),
             nn.Linear(512, env.single_action_space.n),
         )
 
@@ -120,6 +164,69 @@ class QNetwork(nn.Module):
 def linear_schedule(start_e: float, end_e: float, duration: int, t: int):
     slope = (end_e - start_e) / duration
     return max(slope * t + start_e, end_e)
+
+
+def make_vector_env(args, run_name):
+    env_fns = [
+        make_env(args.env_id, args.seed + i, i, args.capture_video, run_name)
+        for i in range(args.num_envs)
+    ]
+    if args.async_vector_env:
+        return gym.vector.AsyncVectorEnv(env_fns, shared_memory=True)
+    return gym.vector.SyncVectorEnv(env_fns)
+
+
+def scalar(value):
+    return float(np.asarray(value).reshape(-1)[0])
+
+
+def get_episode_returns(infos):
+    returns = []
+
+    if "final_info" in infos:
+        final_infos = infos["final_info"]
+        final_info_mask = infos.get("_final_info", np.ones(len(final_infos), dtype=bool))
+        for present, info in zip(final_info_mask, final_infos):
+            if not present or info is None or "episode" not in info:
+                continue
+            returns.append(scalar(info["episode"]["r"]))
+
+    if "episode" in infos:
+        episode_info = infos["episode"]
+        if isinstance(episode_info, dict) and "r" in episode_info:
+            episode_mask = infos.get("_episode", np.ones_like(episode_info["r"], dtype=bool))
+            for present, episode_return in zip(episode_mask, episode_info["r"]):
+                if present:
+                    returns.append(scalar(episode_return))
+
+    return returns
+
+
+def get_real_next_obs(next_obs, truncated, infos):
+    real_next_obs = next_obs.copy()
+    final_observations = infos.get("final_observation")
+    if final_observations is None:
+        return real_next_obs
+
+    final_observation_mask = infos.get("_final_observation", np.ones(len(final_observations), dtype=bool))
+    for idx, is_truncated in enumerate(truncated):
+        if is_truncated and final_observation_mask[idx] and final_observations[idx] is not None:
+            real_next_obs[idx] = final_observations[idx]
+    return real_next_obs
+
+
+def update_target_network(target_network, q_network, tau):
+    for target_network_param, q_network_param in zip(target_network.parameters(), q_network.parameters()):
+        target_network_param.data.copy_(
+            tau * q_network_param.data + (1.0 - tau) * target_network_param.data
+        )
+
+
+def save_checkpoint(q_network, run_dir, exp_name, global_step):
+    model_path = os.path.join(run_dir, f"{exp_name}.step_{global_step}.pth")
+    torch.save(q_network.state_dict(), model_path)
+    return model_path
+
 
 if __name__ == "__main__":
     import stable_baselines3 as sb3
@@ -133,17 +240,24 @@ if __name__ == "__main__":
     
     args = parse_args()
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    run_dir = f"runs/{run_name}"
+    os.makedirs(run_dir, exist_ok=True)
+
+    if args.torch_threads > 0:
+        torch.set_num_threads(args.torch_threads)
 
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = args.torch_deterministic
+    if not args.torch_deterministic:
+        torch.backends.cudnn.benchmark = True
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+    print(f"run_name={run_name}")
+    print(f"device={device}, num_envs={args.num_envs}, async_vector_env={args.async_vector_env}")
 
-    envs = gym.vector.SyncVectorEnv(
-        [make_env(args.env_id, args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)]
-    )
+    envs = make_vector_env(args, run_name)
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
     q_network = QNetwork(envs).to(device)
@@ -156,60 +270,97 @@ if __name__ == "__main__":
         envs.single_observation_space,
         envs.single_action_space,
         device,
+        n_envs=args.num_envs,
         optimize_memory_usage=True,
         handle_timeout_termination=False
     )
     start_time = time.time()
+    recent_returns = deque(maxlen=20)
+    last_loss = None
+    last_checkpoint_step = 0
 
     obs, _ = envs.reset(seed=args.seed)
-    for global_step in range(args.total_timesteps):
-        epsilon = linear_schedule(args.start_e, args.end_e, args.exploration_fraction * args.total_timesteps, global_step)
+    global_step = 0
+    progress = tqdm(
+        total=args.total_timesteps,
+        dynamic_ncols=True,
+        desc="training",
+        unit="step",
+        mininterval=5,
+        maxinterval=30,
+    )
+
+    while global_step < args.total_timesteps:
+        previous_step = global_step
+        epsilon = linear_schedule(
+            args.start_e,
+            args.end_e,
+            int(args.exploration_fraction * args.total_timesteps),
+            global_step,
+        )
         if random.random() < epsilon:
             actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
         else:
-            q_values = q_network(torch.Tensor(obs).to(device))
-            actions = torch.argmax(q_values, dim=1).cpu().numpy()
+            with torch.no_grad():
+                q_values = q_network(torch.as_tensor(obs, device=device))
+                actions = torch.argmax(q_values, dim=1).cpu().numpy()
 
         next_obs, rewards, terminated, truncated, infos = envs.step(actions)
+        global_step += args.num_envs
 
-        if "final_info" in infos:
-            for info in infos["final_info"]:
-                if "episode" not in info:
-                    continue
-                print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
+        for episodic_return in get_episode_returns(infos):
+            recent_returns.append(episodic_return)
 
-        real_next_obs = next_obs.copy()
-        for idx, d in enumerate(truncated):
-            if d:
-                real_next_obs[idx] = infos["final_observation"][idx]
+        real_next_obs = get_real_next_obs(next_obs, truncated, infos)
         rb.add(obs, real_next_obs, actions, rewards, terminated, infos)
 
         obs = next_obs
 
         if global_step > args.learning_starts:
-            if global_step % args.train_frequency == 0:
-                data = rb.sample(args.batch_size)
-                with torch.no_grad():
-                    target_max, _ = target_network(data.next_observations).max(dim=1)
-                    td_target = data.rewards.flatten() + args.gamma * target_max * (1 - data.dones.flatten())
-                old_val = q_network(data.observations).gather(1, data.actions).squeeze()
-                loss = F.mse_loss(td_target, old_val)
+            if global_step // args.train_frequency > previous_step // args.train_frequency:
+                for _ in range(args.gradient_steps):
+                    data = rb.sample(args.batch_size)
+                    with torch.no_grad():
+                        target_max, _ = target_network(data.next_observations).max(dim=1)
+                        td_target = data.rewards.flatten() + args.gamma * target_max * (1 - data.dones.flatten())
+                    old_val = q_network(data.observations).gather(1, data.actions).squeeze()
+                    loss = F.mse_loss(old_val, td_target)
 
-                if global_step % 100 == 0:
-                    print("SPS:", int(global_step / (time.time() - start_time)))
- 
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+                    last_loss = loss.item()
 
-            if global_step % args.target_network_frequency == 0:
-                for target_network_param, q_network_param in zip(target_network.parameters(), q_network.parameters()):
-                    target_network_param.data.copy_(
-                        args.tau * q_network_param.data + (1.0 - args.tau) * target_network_param.data
-                    )
+            if global_step // args.target_network_frequency > previous_step // args.target_network_frequency:
+                update_target_network(target_network, q_network, args.tau)
+
+        if (
+            args.checkpoint_frequency > 0
+            and global_step - last_checkpoint_step >= args.checkpoint_frequency
+            and global_step > 0
+        ):
+            checkpoint_path = save_checkpoint(q_network, run_dir, args.exp_name, global_step)
+            last_checkpoint_step = global_step
+            print(f"checkpoint saved to {checkpoint_path}")
+
+        progress.update(global_step - previous_step)
+        if (
+            args.progress_interval <= 0
+            or global_step // args.progress_interval > previous_step // args.progress_interval
+            or global_step >= args.total_timesteps
+        ):
+            sps = int(global_step / max(time.time() - start_time, 1e-6))
+            postfix = {"sps": sps, "eps": f"{epsilon:.3f}"}
+            if last_loss is not None:
+                postfix["loss"] = f"{last_loss:.4f}"
+            if recent_returns:
+                postfix["return20"] = f"{np.mean(recent_returns):.1f}"
+            progress.set_postfix(postfix, refresh=False)
+
+    progress.close()
 
     if args.save_model:
-        model_path = f"runs/{run_name}/{args.exp_name}.pth"
+        model_path = f"{run_dir}/{args.exp_name}.pth"
         torch.save(q_network.state_dict(), model_path)
         print(f"model saved to {model_path}")
 
@@ -219,12 +370,35 @@ if __name__ == "__main__":
             model_path,
             make_env,
             args.env_id,
-            eval_episode=10,
+            eval_episode=args.eval_episodes,
             run_name=f"{run_name}-eval",
             Model=QNetwork,
             device=device,
             epsilon=0.05,
+            capture_video=True,
         )
+
+        eval_returns = [scalar(episode_return) for episode_return in episodic_returns]
+        summary = {
+            "run_name": run_name,
+            "env_id": args.env_id,
+            "model_path": model_path,
+            "video_dir": f"videos/{run_name}-eval",
+            "total_timesteps": args.total_timesteps,
+            "num_envs": args.num_envs,
+            "async_vector_env": args.async_vector_env,
+            "batch_size": args.batch_size,
+            "gradient_steps": args.gradient_steps,
+            "buffer_size": args.buffer_size,
+            "learning_rate": args.learning_rate,
+            "eval_returns": eval_returns,
+            "eval_mean_return": float(np.mean(eval_returns)) if eval_returns else None,
+            "wall_time_seconds": time.time() - start_time,
+        }
+        summary_path = f"{run_dir}/summary.json"
+        with open(summary_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2)
+        print(f"summary saved to {summary_path}")
        
     envs.close()
 

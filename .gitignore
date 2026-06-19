@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+
+# Training and evaluation artifacts
+videos/
+runs/
+checkpoints/
+*.pth
+*.pt
+*.ckpt
+*.mp4
+
+# Local logs and caches
+*.log
+.pytest_cache/
