@@ -1,9 +1,14 @@
 import argparse
+import csv
 import json
 import os
 import random
+import re
+import shlex
+import sys
 import time
 from collections import deque
+from datetime import datetime
 from distutils.util import strtobool
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
@@ -51,8 +56,8 @@ def parse_args():
         help="if toggled, cuda will be enabled by default")
     parser.add_argument("--capture-video", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="whether to capture videos of the agent performances (check out `videos` folder)")
-    parser.add_argument("--save-model", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
-        help="whether to save model into the `runs/{run_name}` folder")
+    parser.add_argument("--save-model", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
+        help="whether to save the final model into the checkpoint folder")
     parser.add_argument("--hf-entity", type=str, default="",
         help="the user or org name of the model repository from the Hugging Face Hub")
 
@@ -105,14 +110,14 @@ def parse_args():
     return args
 
 
-def make_env(env_id, seed, idx, capture_video, run_name, record_every_episode=False):
+def make_env(env_id, seed, idx, capture_video, run_name, record_every_episode=False, video_dir=None):
     def thunk():
         if capture_video and idx == 0:
             env = gym.make(env_id, render_mode="rgb_array")
             video_kwargs = {}
             if record_every_episode:
                 video_kwargs["episode_trigger"] = lambda episode_id: True
-            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}", **video_kwargs)
+            env = gym.wrappers.RecordVideo(env, video_dir or f"videos/{run_name}", **video_kwargs)
         else:
             env = gym.make(env_id)
 
@@ -168,9 +173,9 @@ def linear_schedule(start_e: float, end_e: float, duration: int, t: int):
     return max(slope * t + start_e, end_e)
 
 
-def make_vector_env(args, run_name):
+def make_vector_env(args, run_name, video_dir=None):
     env_fns = [
-        make_env(args.env_id, args.seed + i, i, args.capture_video, run_name)
+        make_env(args.env_id, args.seed + i, i, args.capture_video, run_name, video_dir=video_dir)
         for i in range(args.num_envs)
     ]
     if args.async_vector_env:
@@ -224,8 +229,57 @@ def update_target_network(target_network, q_network, tau):
         )
 
 
-def save_checkpoint(q_network, run_dir, exp_name, global_step):
-    model_path = os.path.join(run_dir, f"{exp_name}.step_{global_step}.pth")
+def safe_path_part(value):
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value)).strip("._-")
+    return cleaned or "run"
+
+
+def make_run_name(exp_name, seed):
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{safe_path_part(exp_name)}__{timestamp}__seed{seed}"
+
+
+def make_artifact_dirs(run_name):
+    checkpoint_dir = os.path.join("log_checkpoint", "checkpoint", run_name)
+    log_dir = os.path.join("log_checkpoint", "log", run_name)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    os.makedirs(log_dir, exist_ok=True)
+    return checkpoint_dir, log_dir
+
+
+def save_json(path, payload):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+
+def summarize_scores(scores):
+    if not scores:
+        return {
+            "episodes": 0,
+            "mean_score": None,
+            "best_score": None,
+            "highest_score": None,
+            "worst_score": None,
+            "std_score": None,
+            "median_score": None,
+        }
+
+    score_array = np.asarray(scores, dtype=np.float64)
+    return {
+        "episodes": int(len(scores)),
+        "mean_score": float(np.mean(score_array)),
+        "best_score": float(np.max(score_array)),
+        "highest_score": float(np.max(score_array)),
+        "worst_score": float(np.min(score_array)),
+        "std_score": float(np.std(score_array)),
+        "median_score": float(np.median(score_array)),
+    }
+
+
+def save_checkpoint(q_network, checkpoint_dir, exp_name, global_step, label=None):
+    safe_exp_name = safe_path_part(exp_name)
+    checkpoint_label = label or f"step_{global_step}"
+    model_path = os.path.join(checkpoint_dir, f"{safe_exp_name}.{checkpoint_label}.pth")
     torch.save(q_network.state_dict(), model_path)
     return model_path
 
@@ -241,9 +295,27 @@ if __name__ == "__main__":
         )
     
     args = parse_args()
-    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
-    run_dir = f"runs/{run_name}"
-    os.makedirs(run_dir, exist_ok=True)
+    run_name = make_run_name(args.exp_name, args.seed)
+    checkpoint_dir, log_dir = make_artifact_dirs(run_name)
+    train_video_dir = os.path.join(log_dir, "videos", "train")
+    eval_video_dir = os.path.join(log_dir, "videos", "eval")
+    os.makedirs(train_video_dir, exist_ok=True)
+    os.makedirs(eval_video_dir, exist_ok=True)
+    run_config_path = os.path.join(log_dir, "run_config.json")
+    save_json(
+        run_config_path,
+        {
+            "run_name": run_name,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "env_id": args.env_id,
+            "args": vars(args),
+            "command": " ".join(shlex.quote(arg) for arg in sys.argv),
+            "checkpoint_dir": checkpoint_dir,
+            "log_dir": log_dir,
+            "train_video_dir": train_video_dir if args.capture_video else None,
+            "eval_video_dir": eval_video_dir,
+        },
+    )
 
     if args.torch_threads > 0:
         torch.set_num_threads(args.torch_threads)
@@ -260,9 +332,11 @@ if __name__ == "__main__":
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
     print(f"run_name={run_name}")
+    print(f"checkpoint_dir={checkpoint_dir}")
+    print(f"log_dir={log_dir}")
     print(f"device={device}, num_envs={args.num_envs}, async_vector_env={args.async_vector_env}")
 
-    envs = make_vector_env(args, run_name)
+    envs = make_vector_env(args, run_name, video_dir=train_video_dir)
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
     q_network = QNetwork(envs).to(device)
@@ -281,8 +355,29 @@ if __name__ == "__main__":
     )
     start_time = time.time()
     recent_returns = deque(maxlen=20)
+    train_scores = []
+    train_best_score = None
+    train_episode_count = 0
     last_loss = None
     last_checkpoint_step = 0
+    train_episode_log_path = os.path.join(log_dir, "train_episodes.jsonl")
+    train_progress_log_path = os.path.join(log_dir, "train_progress.csv")
+    train_episode_log = open(train_episode_log_path, "w", encoding="utf-8")
+    train_progress_log = open(train_progress_log_path, "w", encoding="utf-8", newline="")
+    progress_writer = csv.DictWriter(
+        train_progress_log,
+        fieldnames=[
+            "global_step",
+            "sps",
+            "epsilon",
+            "loss",
+            "recent_return20_mean",
+            "recent_return20_best",
+            "train_best_score",
+            "episodes",
+        ],
+    )
+    progress_writer.writeheader()
 
     obs, _ = envs.reset(seed=args.seed)
     global_step = 0
@@ -314,7 +409,23 @@ if __name__ == "__main__":
         global_step += args.num_envs
 
         for episodic_return in get_episode_returns(infos):
-            recent_returns.append(episodic_return)
+            score = scalar(episodic_return)
+            recent_returns.append(score)
+            train_scores.append(score)
+            train_best_score = score if train_best_score is None else max(train_best_score, score)
+            train_episode_count += 1
+            train_episode_log.write(
+                json.dumps(
+                    {
+                        "episode": train_episode_count,
+                        "global_step": global_step,
+                        "score": score,
+                        "best_score_so_far": train_best_score,
+                    }
+                )
+                + "\n"
+            )
+            train_episode_log.flush()
 
         real_next_obs = get_real_next_obs(next_obs, truncated, infos)
         rb.add(obs, real_next_obs, actions, rewards, terminated, infos)
@@ -344,7 +455,7 @@ if __name__ == "__main__":
             and global_step - last_checkpoint_step >= args.checkpoint_frequency
             and global_step > 0
         ):
-            checkpoint_path = save_checkpoint(q_network, run_dir, args.exp_name, global_step)
+            checkpoint_path = save_checkpoint(q_network, checkpoint_dir, args.exp_name, global_step)
             last_checkpoint_step = global_step
             print(f"checkpoint saved to {checkpoint_path}")
 
@@ -361,17 +472,33 @@ if __name__ == "__main__":
             if recent_returns:
                 postfix["return20"] = f"{np.mean(recent_returns):.1f}"
             progress.set_postfix(postfix, refresh=False)
+            progress_writer.writerow(
+                {
+                    "global_step": global_step,
+                    "sps": sps,
+                    "epsilon": epsilon,
+                    "loss": last_loss,
+                    "recent_return20_mean": float(np.mean(recent_returns)) if recent_returns else None,
+                    "recent_return20_best": float(np.max(recent_returns)) if recent_returns else None,
+                    "train_best_score": train_best_score,
+                    "episodes": train_episode_count,
+                }
+            )
+            train_progress_log.flush()
 
     progress.close()
+    train_episode_log.close()
+    train_progress_log.close()
+    envs.close()
 
     if args.save_model:
-        model_path = f"{run_dir}/{args.exp_name}.pth"
-        torch.save(q_network.state_dict(), model_path)
+        model_path = save_checkpoint(q_network, checkpoint_dir, args.exp_name, global_step, label=f"final_step_{global_step}")
         print(f"model saved to {model_path}")
 
         from dqn_eval import evaluate
 
-        episodic_returns = evaluate(
+        eval_log_path = os.path.join(log_dir, "eval_episodes.jsonl")
+        eval_result = evaluate(
             model_path,
             make_env,
             args.env_id,
@@ -381,14 +508,57 @@ if __name__ == "__main__":
             device=device,
             epsilon=0.05,
             capture_video=True,
+            video_dir=eval_video_dir,
+            log_path=eval_log_path,
+            return_details=True,
         )
 
-        eval_returns = [scalar(episode_return) for episode_return in episodic_returns]
+        eval_returns = [scalar(episode_return) for episode_return in eval_result["returns"]]
+        eval_episode_lengths = [
+            episode["length"]
+            for episode in eval_result["episodes"]
+            if episode.get("length") is not None
+        ]
+        eval_score_summary = summarize_scores(eval_returns)
+        train_score_summary = summarize_scores(train_scores)
+        best_eval_episode = None
+        if eval_result["episodes"]:
+            best_eval_episode = max(eval_result["episodes"], key=lambda episode: episode["score"])
+        quality = {
+            "run_name": run_name,
+            "env_id": args.env_id,
+            "final_model_path": model_path,
+            "checkpoint_dir": checkpoint_dir,
+            "log_dir": log_dir,
+            "eval_video_dir": eval_video_dir,
+            "score_source": "raw episode scores from Gymnasium RecordEpisodeStatistics",
+            "survival_signal": "Use eval episode lengths and videos to judge whether MsPacman keeps eating without dying.",
+            "eval": {
+                **eval_score_summary,
+                "scores": eval_returns,
+                "episode_lengths": eval_episode_lengths,
+                "longest_episode_length": int(max(eval_episode_lengths)) if eval_episode_lengths else None,
+                "best_episode": best_eval_episode,
+            },
+            "training": {
+                **train_score_summary,
+                "recent20_mean_score": float(np.mean(recent_returns)) if recent_returns else None,
+                "recent20_best_score": float(np.max(recent_returns)) if recent_returns else None,
+            },
+        }
+        quality_path = os.path.join(log_dir, "quality.json")
+        save_json(quality_path, quality)
         summary = {
             "run_name": run_name,
             "env_id": args.env_id,
             "model_path": model_path,
-            "video_dir": f"videos/{run_name}-eval",
+            "checkpoint_dir": checkpoint_dir,
+            "log_dir": log_dir,
+            "train_episode_log": train_episode_log_path,
+            "train_progress_log": train_progress_log_path,
+            "eval_episode_log": eval_log_path,
+            "train_video_dir": train_video_dir if args.capture_video else None,
+            "eval_video_dir": eval_video_dir,
             "total_timesteps": args.total_timesteps,
             "num_envs": args.num_envs,
             "async_vector_env": args.async_vector_env,
@@ -397,14 +567,17 @@ if __name__ == "__main__":
             "buffer_size": args.buffer_size,
             "learning_rate": args.learning_rate,
             "eval_returns": eval_returns,
-            "eval_mean_return": float(np.mean(eval_returns)) if eval_returns else None,
+            "eval_mean_score": eval_score_summary["mean_score"],
+            "eval_best_score": eval_score_summary["best_score"],
+            "eval_highest_score": eval_score_summary["highest_score"],
+            "train_best_score": train_score_summary["best_score"],
+            "train_highest_score": train_score_summary["highest_score"],
+            "quality_path": quality_path,
             "wall_time_seconds": time.time() - start_time,
         }
-        summary_path = f"{run_dir}/summary.json"
-        with open(summary_path, "w", encoding="utf-8") as f:
-            json.dump(summary, f, indent=2)
+        summary_path = os.path.join(log_dir, "summary.json")
+        save_json(summary_path, summary)
+        print(f"quality saved to {quality_path}")
         print(f"summary saved to {summary_path}")
-       
-    envs.close()
 
     

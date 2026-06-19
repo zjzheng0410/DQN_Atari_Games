@@ -5,6 +5,7 @@ __pycache__/
 videos/
 runs/
 checkpoints/
+log_checkpoint/
 *.pth
 *.pt
 *.ckpt
