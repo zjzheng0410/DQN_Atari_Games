@@ -102,6 +102,8 @@ def parse_args():
         help="save a checkpoint every N environment steps; 0 disables checkpoints")
     parser.add_argument("--eval-episodes", type=int, default=10,
         help="the number of evaluation episodes after training")
+    parser.add_argument("--eval-frequency", type=int, default=5000000,
+        help="run a no-video evaluation every N environment steps; 0 disables periodic eval")
     parser.add_argument("--progress-interval", type=int, default=5000,
         help="refresh tqdm postfix every N environment steps")
     args = parser.parse_args()
@@ -284,6 +286,78 @@ def save_checkpoint(q_network, checkpoint_dir, exp_name, global_step, label=None
     return model_path
 
 
+def evaluate_current_model(q_network, env_id, eval_episode, run_name, device, epsilon=0.05, seed=0):
+    if eval_episode <= 0:
+        return {"returns": [], "episodes": [], "video_dir": None}
+
+    from dqn_eval import build_eval_env, get_episode_stats
+
+    envs = gym.vector.SyncVectorEnv(
+        [build_eval_env(make_env, env_id, seed, False, run_name, video_dir=None)]
+    )
+    was_training = q_network.training
+    q_network.eval()
+    eval_random = random.Random(seed)
+    episode_records = []
+
+    try:
+        obs, _ = envs.reset()
+        while len(episode_records) < eval_episode:
+            if eval_random.random() < epsilon:
+                actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
+            else:
+                with torch.no_grad():
+                    q_values = q_network(torch.as_tensor(obs, device=device))
+                    actions = torch.argmax(q_values, dim=1).cpu().numpy()
+
+            next_obs, _, _, _, infos = envs.step(actions)
+            for episode_stat in get_episode_stats(infos):
+                episode_records.append(
+                    {
+                        "episode": len(episode_records) + 1,
+                        "score": episode_stat["score"],
+                        "length": episode_stat.get("length"),
+                        "time": episode_stat.get("time"),
+                    }
+                )
+                if len(episode_records) >= eval_episode:
+                    break
+            obs = next_obs
+    finally:
+        envs.close()
+        if was_training:
+            q_network.train()
+
+    return {
+        "returns": [episode["score"] for episode in episode_records],
+        "episodes": episode_records,
+        "video_dir": None,
+    }
+
+
+def make_eval_record(phase, global_step, eval_result):
+    eval_returns = [scalar(episode_return) for episode_return in eval_result["returns"]]
+    eval_episode_lengths = [
+        episode["length"]
+        for episode in eval_result["episodes"]
+        if episode.get("length") is not None
+    ]
+    eval_score_summary = summarize_scores(eval_returns)
+    return {
+        "phase": phase,
+        "global_step": int(global_step),
+        "episodes": eval_score_summary["episodes"],
+        "eval_mean_score": eval_score_summary["mean_score"],
+        "eval_best_score": eval_score_summary["best_score"],
+        "eval_highest_score": eval_score_summary["highest_score"],
+        "eval_worst_score": eval_score_summary["worst_score"],
+        "eval_std_score": eval_score_summary["std_score"],
+        "eval_median_score": eval_score_summary["median_score"],
+        "scores": eval_returns,
+        "episode_lengths": eval_episode_lengths,
+    }
+
+
 if __name__ == "__main__":
     import stable_baselines3 as sb3
 
@@ -362,8 +436,14 @@ if __name__ == "__main__":
     last_checkpoint_step = 0
     train_episode_log_path = os.path.join(log_dir, "train_episodes.jsonl")
     train_progress_log_path = os.path.join(log_dir, "train_progress.csv")
+    periodic_eval_log_path = os.path.join(log_dir, "periodic_eval.jsonl")
     train_episode_log = open(train_episode_log_path, "w", encoding="utf-8")
     train_progress_log = open(train_progress_log_path, "w", encoding="utf-8", newline="")
+    periodic_eval_log = open(periodic_eval_log_path, "w", encoding="utf-8")
+    best_eval_mean_score = None
+    best_eval_step = None
+    best_model_path = None
+    best_eval_record = None
     progress_writer = csv.DictWriter(
         train_progress_log,
         fieldnames=[
@@ -433,22 +513,64 @@ if __name__ == "__main__":
         obs = next_obs
 
         if global_step > args.learning_starts:
-            if global_step // args.train_frequency > previous_step // args.train_frequency:
-                for _ in range(args.gradient_steps):
-                    data = rb.sample(args.batch_size)
-                    with torch.no_grad():
-                        target_max, _ = target_network(data.next_observations).max(dim=1)
-                        td_target = data.rewards.flatten() + args.gamma * target_max * (1 - data.dones.flatten())
-                    old_val = q_network(data.observations).gather(1, data.actions).squeeze()
-                    loss = F.mse_loss(old_val, td_target)
+            updates_due = max(
+                0,
+                global_step // args.train_frequency
+                - max(previous_step, args.learning_starts) // args.train_frequency,
+            )
+            for _ in range(updates_due * args.gradient_steps):
+                data = rb.sample(args.batch_size)
+                with torch.no_grad():
+                    target_max, _ = target_network(data.next_observations).max(dim=1)
+                    td_target = data.rewards.flatten() + args.gamma * target_max * (1 - data.dones.flatten())
+                old_val = q_network(data.observations).gather(1, data.actions).squeeze()
+                loss = F.mse_loss(old_val, td_target)
 
-                    optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
-                    last_loss = loss.item()
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                last_loss = loss.item()
 
             if global_step // args.target_network_frequency > previous_step // args.target_network_frequency:
                 update_target_network(target_network, q_network, args.tau)
+
+        if (
+            args.eval_frequency > 0
+            and global_step < args.total_timesteps
+            and global_step // args.eval_frequency > previous_step // args.eval_frequency
+        ):
+            periodic_eval_result = evaluate_current_model(
+                q_network,
+                args.env_id,
+                args.eval_episodes,
+                run_name=f"{run_name}-periodic-eval-step-{global_step}",
+                device=device,
+                epsilon=0.05,
+            )
+            eval_record = make_eval_record("periodic", global_step, periodic_eval_result)
+            periodic_eval_log.write(json.dumps(eval_record) + "\n")
+            periodic_eval_log.flush()
+            eval_mean_score = eval_record["eval_mean_score"]
+            if (
+                eval_mean_score is not None
+                and (best_eval_mean_score is None or eval_mean_score > best_eval_mean_score)
+            ):
+                best_eval_mean_score = eval_mean_score
+                best_eval_step = global_step
+                best_eval_record = eval_record
+                if args.save_model:
+                    best_model_path = save_checkpoint(
+                        q_network,
+                        checkpoint_dir,
+                        args.exp_name,
+                        global_step,
+                        label="best_eval_mean",
+                    )
+                    progress.write(f"best eval model saved to {best_model_path}")
+            progress.write(
+                f"periodic_eval step={global_step} "
+                f"mean={eval_record['eval_mean_score']} best={eval_record['eval_best_score']}"
+            )
 
         if (
             args.checkpoint_frequency > 0
@@ -513,12 +635,28 @@ if __name__ == "__main__":
             return_details=True,
         )
 
-        eval_returns = [scalar(episode_return) for episode_return in eval_result["returns"]]
-        eval_episode_lengths = [
-            episode["length"]
-            for episode in eval_result["episodes"]
-            if episode.get("length") is not None
-        ]
+        eval_record = make_eval_record("final", global_step, eval_result)
+        periodic_eval_log.write(json.dumps(eval_record) + "\n")
+        periodic_eval_log.flush()
+        eval_mean_score = eval_record["eval_mean_score"]
+        if (
+            eval_mean_score is not None
+            and (best_eval_mean_score is None or eval_mean_score > best_eval_mean_score)
+        ):
+            best_eval_mean_score = eval_mean_score
+            best_eval_step = global_step
+            best_eval_record = eval_record
+            best_model_path = save_checkpoint(
+                q_network,
+                checkpoint_dir,
+                args.exp_name,
+                global_step,
+                label="best_eval_mean",
+            )
+            print(f"best eval model saved to {best_model_path}")
+
+        eval_returns = eval_record["scores"]
+        eval_episode_lengths = eval_record["episode_lengths"]
         eval_score_summary = summarize_scores(eval_returns)
         train_score_summary = summarize_scores(train_scores)
         best_eval_episode = None
@@ -531,6 +669,10 @@ if __name__ == "__main__":
             "checkpoint_dir": checkpoint_dir,
             "log_dir": log_dir,
             "eval_video_dir": eval_video_dir,
+            "periodic_eval_log": periodic_eval_log_path,
+            "best_model_path": best_model_path,
+            "best_eval_mean_score": best_eval_mean_score,
+            "best_eval_step": best_eval_step,
             "score_source": "raw episode scores from Gymnasium RecordEpisodeStatistics",
             "survival_signal": "Use eval episode lengths and videos to judge whether MsPacman keeps eating without dying.",
             "eval": {
@@ -545,6 +687,7 @@ if __name__ == "__main__":
                 "recent20_mean_score": float(np.mean(recent_returns)) if recent_returns else None,
                 "recent20_best_score": float(np.max(recent_returns)) if recent_returns else None,
             },
+            "best_eval": best_eval_record,
         }
         quality_path = os.path.join(log_dir, "quality.json")
         save_json(quality_path, quality)
@@ -556,6 +699,7 @@ if __name__ == "__main__":
             "log_dir": log_dir,
             "train_episode_log": train_episode_log_path,
             "train_progress_log": train_progress_log_path,
+            "periodic_eval_log": periodic_eval_log_path,
             "eval_episode_log": eval_log_path,
             "train_video_dir": train_video_dir if args.capture_video else None,
             "eval_video_dir": eval_video_dir,
@@ -570,6 +714,9 @@ if __name__ == "__main__":
             "eval_mean_score": eval_score_summary["mean_score"],
             "eval_best_score": eval_score_summary["best_score"],
             "eval_highest_score": eval_score_summary["highest_score"],
+            "best_eval_mean_score": best_eval_mean_score,
+            "best_eval_step": best_eval_step,
+            "best_model_path": best_model_path,
             "train_best_score": train_score_summary["best_score"],
             "train_highest_score": train_score_summary["highest_score"],
             "quality_path": quality_path,
@@ -580,4 +727,5 @@ if __name__ == "__main__":
         print(f"quality saved to {quality_path}")
         print(f"summary saved to {summary_path}")
 
+    periodic_eval_log.close()
     

@@ -1,11 +1,11 @@
 cd /home/zjzheng/Lesson/AI_2026spring/PJ3/DQN-Atari_Games
 
-# Final training command. Artifacts are saved under log_checkpoint/.
 python dqn_atari.py \
-  --exp-name MsPacman-v5-320envs \
+  --exp-name MsPacman-v5-640envs \
   --capture-video \
   --env-id ALE/MsPacman-v5 \
   --total-timesteps 50000000 \
-  --num-envs 448 \
+  --num-envs 640 \
+  --batch-size 64 \
   --buffer-size 400000 \
   --async-vector-env
