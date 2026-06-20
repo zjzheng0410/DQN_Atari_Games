@@ -6,11 +6,14 @@ python dqn_atari.py \
   --env-id ALE/MsPacman-v5 \
   --total-timesteps 50000000 \
   --num-envs 640 \
-  --batch-size 256 \
+  --torch-deterministic false \
+  --train-frequency 40 \
+  --batch-size 512 \
   --buffer-size 400000 \
+  --target-network-frequency 8000 \
   --async-vector-env \
   --replay-buffer-device cuda \
   --async-learner \
-  --replay-sample-chunk-updates 192 \
+  --replay-sample-chunk-updates 64 \
   --max-learner-lag-updates 8192 \
   --actor-policy-sync-frequency 5000
