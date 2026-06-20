@@ -8,7 +8,6 @@ import shlex
 import sys
 import threading
 import time
-from contextlib import nullcontext
 from collections import deque
 from datetime import datetime
 from distutils.util import strtobool
@@ -19,8 +18,15 @@ import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
+from dqn_learner import (
+    AsyncLearner,
+    maybe_lock,
+    run_gradient_updates,
+    update_target_network,
+)
+from dqn_profiling import ProfileJSONLWriter, StageProfiler
+from dqn_replay import get_replay_stats, make_replay_buffer, resolve_async_learner
 from stable_baselines3.common.atari_wrappers import (
     ClipRewardEnv,
     EpisodicLifeEnv,
@@ -28,8 +34,6 @@ from stable_baselines3.common.atari_wrappers import (
     MaxAndSkipEnv,
     NoopResetEnv
 )
-from stable_baselines3.common.buffers import ReplayBuffer
-from stable_baselines3.common.type_aliases import ReplayBufferSamples
 from tqdm import tqdm
 
 try:
@@ -118,6 +122,12 @@ def parse_args():
         help="run a no-video evaluation every N environment steps; 0 disables periodic eval")
     parser.add_argument("--progress-interval", type=int, default=5000,
         help="refresh tqdm postfix every N environment steps")
+    parser.add_argument("--profile-timings", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
+        help="write fine-grained training timing windows to profile_times.jsonl")
+    parser.add_argument("--profile-log-interval", type=int, default=0,
+        help="write profiling stats every N environment steps; 0 reuses progress-interval")
+    parser.add_argument("--profile-cuda-mode", type=str, default="event", choices=["event", "sync", "cpu"],
+        help="CUDA timing mode for profiling: event is low-overhead, sync is precise but slower, cpu ignores CUDA events")
     parser.add_argument("--replay-buffer-device", type=str, default="auto", choices=["auto", "cpu", "cuda"],
         help="where to store replay data; auto uses cuda when available")
     parser.add_argument("--replay-sample-chunk-updates", type=int, default=64,
@@ -246,273 +256,6 @@ def get_real_next_obs(next_obs, truncated, infos):
     return real_next_obs
 
 
-def update_target_network(target_network, q_network, tau):
-    for target_network_param, q_network_param in zip(target_network.parameters(), q_network.parameters()):
-        target_network_param.data.copy_(
-            tau * q_network_param.data + (1.0 - tau) * target_network_param.data
-        )
-
-
-class GpuReplayBuffer:
-    def __init__(self, buffer_size, observation_space, action_space, device, n_envs):
-        if device.type != "cuda":
-            raise ValueError("GpuReplayBuffer requires a CUDA device")
-        if not isinstance(action_space, gym.spaces.Discrete):
-            raise ValueError("GpuReplayBuffer only supports discrete action spaces")
-
-        self.device = device
-        self.n_envs = int(n_envs)
-        self.action_dim = 1
-        self.obs_shape = tuple(observation_space.shape)
-        self.transition_capacity = int(buffer_size)
-        self.buffer_size = max(self.transition_capacity // self.n_envs, 2)
-        self.full = False
-        self.pos = 0
-
-        self.observations = torch.empty(
-            (self.buffer_size, self.n_envs, *self.obs_shape),
-            dtype=torch.uint8,
-            device=self.device,
-        )
-        self.actions = torch.empty((self.buffer_size, self.n_envs, 1), dtype=torch.long, device=self.device)
-        self.rewards = torch.empty((self.buffer_size, self.n_envs), dtype=torch.float32, device=self.device)
-        self.dones = torch.empty((self.buffer_size, self.n_envs), dtype=torch.float32, device=self.device)
-
-    @property
-    def capacity(self):
-        return self.buffer_size * self.n_envs
-
-    @property
-    def transition_count(self):
-        rows = self.buffer_size if self.full else self.pos
-        return rows * self.n_envs
-
-    def add(self, obs, next_obs, action, reward, done, infos=None):
-        obs_tensor = torch.as_tensor(np.asarray(obs), dtype=torch.uint8, device=self.device)
-        next_obs_tensor = torch.as_tensor(np.asarray(next_obs), dtype=torch.uint8, device=self.device)
-        action_tensor = torch.as_tensor(np.asarray(action).reshape(self.n_envs, 1), dtype=torch.long, device=self.device)
-        reward_tensor = torch.as_tensor(np.asarray(reward), dtype=torch.float32, device=self.device)
-        done_tensor = torch.as_tensor(np.asarray(done), dtype=torch.float32, device=self.device)
-
-        self.observations[self.pos].copy_(obs_tensor, non_blocking=True)
-        self.observations[(self.pos + 1) % self.buffer_size].copy_(next_obs_tensor, non_blocking=True)
-        self.actions[self.pos].copy_(action_tensor, non_blocking=True)
-        self.rewards[self.pos].copy_(reward_tensor, non_blocking=True)
-        self.dones[self.pos].copy_(done_tensor, non_blocking=True)
-
-        self.pos += 1
-        if self.pos == self.buffer_size:
-            self.full = True
-            self.pos = 0
-
-    def sample(self, batch_size):
-        samples = self.sample_many(batch_size, 1)
-        return slice_replay_samples(samples, 0)
-
-    def sample_many(self, batch_size, num_batches):
-        if self.transition_count <= 0:
-            raise ValueError("Cannot sample from an empty replay buffer")
-
-        total_samples = int(batch_size) * int(num_batches)
-        if self.full:
-            batch_inds = (
-                torch.randint(1, self.buffer_size, (total_samples,), device=self.device) + self.pos
-            ) % self.buffer_size
-        else:
-            batch_inds = torch.randint(0, self.pos, (total_samples,), device=self.device)
-        env_indices = torch.randint(0, self.n_envs, (total_samples,), device=self.device)
-        next_batch_inds = (batch_inds + 1) % self.buffer_size
-
-        batch_shape = (int(num_batches), int(batch_size))
-        observations = self.observations[batch_inds, env_indices].reshape(*batch_shape, *self.obs_shape)
-        next_observations = self.observations[next_batch_inds, env_indices].reshape(*batch_shape, *self.obs_shape)
-        actions = self.actions[batch_inds, env_indices].reshape(*batch_shape, 1)
-        dones = self.dones[batch_inds, env_indices].reshape(*batch_shape, 1)
-        rewards = self.rewards[batch_inds, env_indices].reshape(*batch_shape, 1)
-        return ReplayBufferSamples(observations, actions, next_observations, dones, rewards)
-
-    def stats(self):
-        tensors = (self.observations, self.actions, self.rewards, self.dones)
-        bytes_used = sum(tensor.numel() * tensor.element_size() for tensor in tensors)
-        return {
-            "replay_device": str(self.device),
-            "replay_rows": self.buffer_size,
-            "replay_capacity": self.capacity,
-            "replay_transitions": self.transition_count,
-            "replay_memory_gib": bytes_used / (1024 ** 3),
-        }
-
-
-def slice_replay_samples(samples, index):
-    return ReplayBufferSamples(
-        samples.observations[index],
-        samples.actions[index],
-        samples.next_observations[index],
-        samples.dones[index],
-        samples.rewards[index],
-    )
-
-
-def maybe_lock(lock):
-    return lock if lock is not None else nullcontext()
-
-
-def train_replay_batch(samples, q_network, target_network, optimizer, args):
-    actions = samples.actions.long()
-    with torch.no_grad():
-        target_max, _ = target_network(samples.next_observations).max(dim=1)
-        td_target = samples.rewards.flatten() + args.gamma * target_max * (1 - samples.dones.flatten())
-    old_val = q_network(samples.observations).gather(1, actions).squeeze()
-    loss = F.mse_loss(old_val, td_target)
-
-    optimizer.zero_grad(set_to_none=True)
-    loss.backward()
-    optimizer.step()
-    return loss.item()
-
-
-def run_gradient_updates(rb, q_network, target_network, optimizer, args, num_updates, replay_lock=None, network_lock=None):
-    last_loss = None
-    updates_left = int(num_updates)
-    sample_chunk_updates = max(int(args.replay_sample_chunk_updates), 1)
-
-    while updates_left > 0:
-        chunk_updates = min(updates_left, sample_chunk_updates)
-        if hasattr(rb, "sample_many"):
-            with maybe_lock(replay_lock):
-                sample_block = rb.sample_many(args.batch_size, chunk_updates)
-            with maybe_lock(network_lock):
-                for batch_idx in range(chunk_updates):
-                    last_loss = train_replay_batch(
-                        slice_replay_samples(sample_block, batch_idx),
-                        q_network,
-                        target_network,
-                        optimizer,
-                        args,
-                    )
-        else:
-            with maybe_lock(network_lock):
-                for _ in range(chunk_updates):
-                    with maybe_lock(replay_lock):
-                        samples = rb.sample(args.batch_size)
-                    last_loss = train_replay_batch(samples, q_network, target_network, optimizer, args)
-        updates_left -= chunk_updates
-
-    return last_loss
-
-
-class AsyncLearner:
-    def __init__(self, rb, q_network, target_network, optimizer, args, replay_lock, network_lock):
-        self.rb = rb
-        self.q_network = q_network
-        self.target_network = target_network
-        self.optimizer = optimizer
-        self.args = args
-        self.replay_lock = replay_lock
-        self.network_lock = network_lock
-        self.condition = threading.Condition()
-        self.pending_updates = 0
-        self.requested_updates = 0
-        self.completed_updates = 0
-        self.target_update_milestones = deque()
-        self.last_loss = None
-        self.stop_requested = False
-        self.thread = threading.Thread(target=self._run, name="dqn-async-learner", daemon=True)
-
-    def start(self):
-        self.thread.start()
-
-    def add_updates(self, num_updates):
-        if num_updates <= 0:
-            return
-        with self.condition:
-            self.pending_updates += int(num_updates)
-            self.requested_updates += int(num_updates)
-            self.condition.notify_all()
-
-    def request_target_update(self):
-        with self.condition:
-            self.target_update_milestones.append(self.requested_updates)
-            self.condition.notify_all()
-
-    def wait_for_backlog(self, max_backlog):
-        if max_backlog <= 0:
-            return
-        with self.condition:
-            while self.pending_updates > max_backlog and not self.stop_requested:
-                self.condition.wait(timeout=0.01)
-
-    def get_stats(self):
-        with self.condition:
-            return {
-                "learner_backlog": self.pending_updates,
-                "learner_updates": self.completed_updates,
-                "loss": self.last_loss,
-            }
-
-    def stop_and_join(self):
-        with self.condition:
-            self.stop_requested = True
-            self.condition.notify_all()
-        self.thread.join()
-
-    def _pop_due_target_updates(self):
-        with self.condition:
-            due_count = 0
-            while (
-                self.target_update_milestones
-                and self.completed_updates >= self.target_update_milestones[0]
-            ):
-                self.target_update_milestones.popleft()
-                due_count += 1
-            return due_count
-
-    def _apply_due_target_updates(self):
-        due_count = self._pop_due_target_updates()
-        if due_count <= 0:
-            return
-        with self.network_lock:
-            for _ in range(due_count):
-                update_target_network(self.target_network, self.q_network, self.args.tau)
-
-    def _run(self):
-        while True:
-            with self.condition:
-                while (
-                    not self.stop_requested
-                    and self.pending_updates <= 0
-                    and not self.target_update_milestones
-                ):
-                    self.condition.wait()
-                if self.stop_requested and self.pending_updates <= 0:
-                    break
-                chunk_updates = min(
-                    self.pending_updates,
-                    max(int(self.args.replay_sample_chunk_updates), 1),
-                )
-                self.pending_updates -= chunk_updates
-
-            if chunk_updates > 0:
-                last_loss = run_gradient_updates(
-                    self.rb,
-                    self.q_network,
-                    self.target_network,
-                    self.optimizer,
-                    self.args,
-                    chunk_updates,
-                    replay_lock=self.replay_lock,
-                    network_lock=self.network_lock,
-                )
-                with self.condition:
-                    self.completed_updates += chunk_updates
-                    self.last_loss = last_loss
-                    self.condition.notify_all()
-
-            self._apply_due_target_updates()
-
-        self._apply_due_target_updates()
-
-
 def cuda_memory_stats(device):
     if device.type != "cuda":
         return None, None
@@ -537,62 +280,6 @@ def sync_actor_network(actor_network, q_network, network_lock):
         return
     with maybe_lock(network_lock):
         actor_network.load_state_dict(q_network.state_dict())
-
-
-def make_replay_buffer(args, envs, device):
-    requested_device = args.replay_buffer_device
-    use_gpu_replay = requested_device == "cuda" or (requested_device == "auto" and device.type == "cuda")
-    if use_gpu_replay:
-        if device.type != "cuda":
-            if requested_device == "cuda":
-                raise ValueError("--replay-buffer-device cuda requires --cuda and a visible CUDA device")
-        else:
-            try:
-                rb = GpuReplayBuffer(
-                    args.buffer_size,
-                    envs.single_observation_space,
-                    envs.single_action_space,
-                    device,
-                    args.num_envs,
-                )
-                return rb, "cuda", None
-            except RuntimeError as exc:
-                if requested_device == "cuda":
-                    raise
-                print(f"GPU replay allocation failed, falling back to CPU replay: {exc}")
-
-    rb = ReplayBuffer(
-        args.buffer_size,
-        envs.single_observation_space,
-        envs.single_action_space,
-        device,
-        n_envs=args.num_envs,
-        optimize_memory_usage=True,
-        handle_timeout_termination=False,
-    )
-    return rb, "cpu", "cuda unavailable or not requested"
-
-
-def get_replay_stats(rb, replay_device, args):
-    if hasattr(rb, "stats"):
-        return rb.stats()
-    rows = getattr(rb, "buffer_size", None)
-    pos = getattr(rb, "pos", 0)
-    full = getattr(rb, "full", False)
-    row_count = rows if full else pos
-    return {
-        "replay_device": replay_device,
-        "replay_rows": rows,
-        "replay_capacity": rows * args.num_envs if rows is not None else args.buffer_size,
-        "replay_transitions": row_count * args.num_envs if rows is not None else None,
-        "replay_memory_gib": None,
-    }
-
-
-def resolve_async_learner(args, rb, device):
-    if args.async_learner == "auto":
-        return device.type == "cuda" and isinstance(rb, GpuReplayBuffer) and args.num_envs > 1
-    return bool(args.async_learner)
 
 
 def safe_path_part(value):
@@ -740,6 +427,8 @@ if __name__ == "__main__":
     os.makedirs(train_video_dir, exist_ok=True)
     os.makedirs(eval_video_dir, exist_ok=True)
     run_config_path = os.path.join(log_dir, "run_config.json")
+    profile_times_log_path = os.path.join(log_dir, "profile_times.jsonl")
+    profile_log_interval = args.profile_log_interval if args.profile_log_interval > 0 else args.progress_interval
     run_config = {
         "run_name": run_name,
         "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -750,6 +439,12 @@ if __name__ == "__main__":
         "log_dir": log_dir,
         "train_video_dir": train_video_dir if args.capture_video else None,
         "eval_video_dir": eval_video_dir,
+        "profile_times_path": profile_times_log_path if args.profile_timings else None,
+        "profiling": {
+            "enabled": args.profile_timings,
+            "log_interval": profile_log_interval,
+            "cuda_mode": args.profile_cuda_mode,
+        },
     }
     save_json(run_config_path, run_config)
 
@@ -767,6 +462,11 @@ if __name__ == "__main__":
     if device.type == "cuda" and args.allow_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
+    profiler = StageProfiler(
+        enabled=args.profile_timings,
+        cuda_mode=args.profile_cuda_mode,
+        device=device,
+    )
     print(f"run_name={run_name}")
     print(f"checkpoint_dir={checkpoint_dir}")
     print(f"log_dir={log_dir}")
@@ -791,7 +491,16 @@ if __name__ == "__main__":
     if async_learner_enabled:
         acting_network = QNetwork(envs).to(device)
         acting_network.load_state_dict(q_network.state_dict())
-        learner = AsyncLearner(rb, q_network, target_network, optimizer, args, replay_lock, network_lock)
+        learner = AsyncLearner(
+            rb,
+            q_network,
+            target_network,
+            optimizer,
+            args,
+            replay_lock,
+            network_lock,
+            profiler=profiler,
+        )
         learner.start()
 
     run_config["runtime"] = {
@@ -818,6 +527,7 @@ if __name__ == "__main__":
     train_episode_log = open(train_episode_log_path, "w", encoding="utf-8")
     train_progress_log = open(train_progress_log_path, "w", encoding="utf-8", newline="")
     periodic_eval_log = open(periodic_eval_log_path, "w", encoding="utf-8")
+    profile_writer = ProfileJSONLWriter(profile_times_log_path, profiler)
     best_eval_mean_score = None
     best_eval_step = None
     best_model_path = None
@@ -865,11 +575,13 @@ if __name__ == "__main__":
         if random.random() < epsilon:
             actions = np.random.randint(0, envs.single_action_space.n, size=args.num_envs, dtype=np.int64)
         else:
-            with torch.no_grad():
-                q_values = acting_network(torch.as_tensor(obs, device=device))
-                actions = torch.argmax(q_values, dim=1).cpu().numpy()
+            with profiler.stage("actor_inference"):
+                with torch.no_grad():
+                    q_values = acting_network(torch.as_tensor(obs, device=device))
+                    actions = torch.argmax(q_values, dim=1).cpu().numpy()
 
-        next_obs, rewards, terminated, truncated, infos = envs.step(actions)
+        with profiler.stage("envs.step"):
+            next_obs, rewards, terminated, truncated, infos = envs.step(actions)
         global_step += args.num_envs
 
         for episodic_return in get_episode_returns(infos):
@@ -893,7 +605,8 @@ if __name__ == "__main__":
 
         real_next_obs = get_real_next_obs(next_obs, truncated, infos)
         with replay_lock:
-            rb.add(obs, real_next_obs, actions, rewards, terminated, infos)
+            with profiler.stage("rb.add", use_cuda=replay_device == "cuda"):
+                rb.add(obs, real_next_obs, actions, rewards, terminated, infos)
 
         obs = next_obs
 
@@ -916,6 +629,7 @@ if __name__ == "__main__":
                         args,
                         total_updates_due,
                         replay_lock=replay_lock,
+                        profiler=profiler,
                     )
 
             if global_step // args.target_network_frequency > previous_step // args.target_network_frequency:
@@ -993,11 +707,17 @@ if __name__ == "__main__":
             print(f"checkpoint saved to {checkpoint_path}")
 
         progress.update(global_step - previous_step)
-        if (
+        should_write_progress = (
             args.progress_interval <= 0
             or global_step // args.progress_interval > previous_step // args.progress_interval
             or global_step >= args.total_timesteps
-        ):
+        )
+        should_write_profile = args.profile_timings and (
+            profile_log_interval <= 0
+            or global_step // profile_log_interval > previous_step // profile_log_interval
+            or global_step >= args.total_timesteps
+        )
+        if should_write_progress or should_write_profile:
             learner_stats = learner.get_stats() if learner is not None else {
                 "learner_backlog": 0,
                 "learner_updates": 0,
@@ -1007,33 +727,51 @@ if __name__ == "__main__":
                 last_loss = learner_stats["loss"]
             gpu_memory_allocated_mb, gpu_memory_reserved_mb = cuda_memory_stats(device)
             sps = int(global_step / max(time.time() - start_time, 1e-6))
-            postfix = {"sps": sps, "eps": f"{epsilon:.3f}"}
-            if last_loss is not None:
-                postfix["loss"] = f"{last_loss:.4f}"
-            if learner is not None:
-                postfix["lag"] = learner_stats["learner_backlog"]
-            if recent_returns:
-                postfix["return20"] = f"{np.mean(recent_returns):.1f}"
-            progress.set_postfix(postfix, refresh=False)
-            progress_writer.writerow(
-                {
-                    "global_step": global_step,
-                    "sps": sps,
-                    "epsilon": epsilon,
-                    "loss": last_loss,
-                    "recent_return20_mean": float(np.mean(recent_returns)) if recent_returns else None,
-                    "recent_return20_best": float(np.max(recent_returns)) if recent_returns else None,
-                    "train_best_score": train_best_score,
-                    "episodes": train_episode_count,
-                    "replay_device": replay_device,
-                    "async_learner": async_learner_enabled,
-                    "learner_backlog": learner_stats["learner_backlog"],
-                    "learner_updates": learner_stats["learner_updates"],
-                    "gpu_memory_allocated_mb": gpu_memory_allocated_mb,
-                    "gpu_memory_reserved_mb": gpu_memory_reserved_mb,
-                }
-            )
-            train_progress_log.flush()
+
+            if should_write_progress:
+                postfix = {"sps": sps, "eps": f"{epsilon:.3f}"}
+                if last_loss is not None:
+                    postfix["loss"] = f"{last_loss:.4f}"
+                if learner is not None:
+                    postfix["lag"] = learner_stats["learner_backlog"]
+                if recent_returns:
+                    postfix["return20"] = f"{np.mean(recent_returns):.1f}"
+                progress.set_postfix(postfix, refresh=False)
+                progress_writer.writerow(
+                    {
+                        "global_step": global_step,
+                        "sps": sps,
+                        "epsilon": epsilon,
+                        "loss": last_loss,
+                        "recent_return20_mean": float(np.mean(recent_returns)) if recent_returns else None,
+                        "recent_return20_best": float(np.max(recent_returns)) if recent_returns else None,
+                        "train_best_score": train_best_score,
+                        "episodes": train_episode_count,
+                        "replay_device": replay_device,
+                        "async_learner": async_learner_enabled,
+                        "learner_backlog": learner_stats["learner_backlog"],
+                        "learner_updates": learner_stats["learner_updates"],
+                        "gpu_memory_allocated_mb": gpu_memory_allocated_mb,
+                        "gpu_memory_reserved_mb": gpu_memory_reserved_mb,
+                    }
+                )
+                train_progress_log.flush()
+
+            if should_write_profile:
+                profile_writer.write_snapshot(
+                    global_step,
+                    metadata={
+                        "sps": sps,
+                        "epsilon": epsilon,
+                        "loss": last_loss,
+                        "replay_device": replay_device,
+                        "async_learner": async_learner_enabled,
+                        "learner_backlog": learner_stats["learner_backlog"],
+                        "learner_updates": learner_stats["learner_updates"],
+                        "gpu_memory_allocated_mb": gpu_memory_allocated_mb,
+                        "gpu_memory_reserved_mb": gpu_memory_reserved_mb,
+                    },
+                )
 
     if learner is not None:
         progress.write("waiting for async learner to drain queued updates")
@@ -1041,6 +779,29 @@ if __name__ == "__main__":
         learner_stats = learner.get_stats()
         if learner_stats["loss"] is not None:
             last_loss = learner_stats["loss"]
+
+    final_profile_learner_stats = learner.get_stats() if learner is not None else {
+        "learner_backlog": 0,
+        "learner_updates": 0,
+        "loss": last_loss,
+    }
+    final_gpu_memory_allocated_mb, final_gpu_memory_reserved_mb = cuda_memory_stats(device)
+    profile_writer.write_snapshot(
+        global_step,
+        metadata={
+            "sps": int(global_step / max(time.time() - start_time, 1e-6)),
+            "epsilon": epsilon if "epsilon" in locals() else None,
+            "loss": last_loss,
+            "replay_device": replay_device,
+            "async_learner": async_learner_enabled,
+            "learner_backlog": final_profile_learner_stats["learner_backlog"],
+            "learner_updates": final_profile_learner_stats["learner_updates"],
+            "gpu_memory_allocated_mb": final_gpu_memory_allocated_mb,
+            "gpu_memory_reserved_mb": final_gpu_memory_reserved_mb,
+        },
+        force=profiler.has_data(),
+    )
+    profile_writer.close()
 
     progress.close()
     train_episode_log.close()
@@ -1118,6 +879,7 @@ if __name__ == "__main__":
             "log_dir": log_dir,
             "eval_video_dir": eval_video_dir,
             "periodic_eval_log": periodic_eval_log_path,
+            "profile_times_log": profile_times_log_path if args.profile_timings else None,
             "best_model_path": best_model_path,
             "best_eval_mean_score": best_eval_mean_score,
             "best_eval_step": best_eval_step,
@@ -1153,6 +915,7 @@ if __name__ == "__main__":
             "train_episode_log": train_episode_log_path,
             "train_progress_log": train_progress_log_path,
             "periodic_eval_log": periodic_eval_log_path,
+            "profile_times_log": profile_times_log_path if args.profile_timings else None,
             "eval_episode_log": eval_log_path,
             "train_video_dir": train_video_dir if args.capture_video else None,
             "eval_video_dir": eval_video_dir,
