@@ -1,11 +1,16 @@
 cd /home/zjzheng/Lesson/AI_2026spring/PJ3/DQN-Atari_Games
 
-python dqn_atari.py \
+/home/zjzheng/miniconda3/envs/ai_2026spring/bin/python dqn_atari.py \
   --exp-name MsPacman-v5-640envs \
   --capture-video \
   --env-id ALE/MsPacman-v5 \
   --total-timesteps 50000000 \
   --num-envs 640 \
-  --batch-size 64 \
+  --batch-size 128 \
   --buffer-size 400000 \
-  --async-vector-env
+  --async-vector-env \
+  --replay-buffer-device cuda \
+  --async-learner \
+  --replay-sample-chunk-updates 96 \
+  --max-learner-lag-updates 4096 \
+  --actor-policy-sync-frequency 1000
